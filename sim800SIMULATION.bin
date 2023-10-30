@@ -1,0 +1,303 @@
+#include <Wire.h>
+#include <SPIFFS.h>
+#include <EEPROM.h>
+#define TINY_GSM_MODEM_SIM800
+#include <TinyGsmClient.h>
+
+// Define your constants and initialize variables
+const char apn[] = "internet";
+const char simPIN[] = "";
+const char server[] = "api.thingspeak.com";
+const int port = 80;
+
+#define MODEM_RST 5
+#define MODEM_PWKEY 4
+#define I2C_SDA 21
+#define I2C_SCL 22
+#define MODEM_POWER_ON 23
+#define MODEM_RX 26
+#define MODEM_TX 27
+
+#define SerialMon Serial
+#define SerialAT Serial1
+
+#define TINY_GSM_RX_BUFFER 4096
+
+String apiKeyValue = "0K3TRW28BXQZZHZF";
+String dataMessage;
+
+TinyGsm modem(SerialAT);
+TwoWire I2CPower = TwoWire(0);
+TinyGsmClient client(modem);
+
+int numUnsentReadings = 0;
+
+RTC_DATA_ATTR int readingID = 0;
+RTC_DATA_ATTR float elapsedTime = 0.0;
+RTC_DATA_ATTR float temperature;
+RTC_DATA_ATTR float roomtemperature;
+RTC_DATA_ATTR float roomhumidity;
+RTC_DATA_ATTR float averageTemperature = 0.0;
+RTC_DATA_ATTR float maturityIndex = 0.0;
+RTC_DATA_ATTR float batteryPercentage = 0.0;
+
+const uint64_t uS_TO_S_FACTOR = 1000000;
+const uint64_t TIME_TO_SLEEP = 120;
+#define IP5306_ADDR 0x75
+#define IP5306_REG_SYS_CTL0 0x00
+
+bool hasInternetConnection() {
+  return modem.isGprsConnected();
+}
+
+bool setPowerBoostKeepOn(int en) {
+  I2CPower.beginTransmission(IP5306_ADDR);
+  I2CPower.write(IP5306_REG_SYS_CTL0);
+  if (en) {
+    I2CPower.write(0x37);
+  } else {
+    I2CPower.write(0x35);
+  }
+  return I2CPower.endTransmission() == 0;
+}
+
+void setup() {
+  SerialMon.begin(115200);
+
+  Wire.begin();
+
+  I2CPower.begin(I2C_SDA, I2C_SCL, 400000);
+
+  bool isOk = setPowerBoostKeepOn(1);
+  if (isOk) {
+    SerialMon.println("Okay");
+  } else {
+    SerialMon.println("Failed to set power boost.");
+  }
+
+  SerialMon.println("Initializing modem...");
+  modem.init();
+  pinMode(MODEM_PWKEY, OUTPUT);
+  pinMode(MODEM_RST, OUTPUT);
+  pinMode(MODEM_POWER_ON, OUTPUT);
+  digitalWrite(MODEM_PWKEY, LOW);
+  digitalWrite(MODEM_RST, HIGH);
+  digitalWrite(MODEM_POWER_ON, HIGH);
+  SerialAT.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  delay(3000);
+
+  SerialMon.print("Connecting to APN: ");
+  SerialMon.print(apn);
+  if (!modem.gprsConnect(apn)) {
+    SerialMon.println("Failed to connect to APN.");
+  } else {
+    SerialMon.println("Connected to APN successfully.");
+  }
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS initialization failed!");
+    return;
+  }
+  readingID++;
+  File file = SPIFFS.open("/data.txt", "r");
+  if (!file) {
+    Serial.println("File doesn't exist");
+    Serial.println("Creating file...");
+    writeFile("/data.txt", "Reading ID, Room Temperature, Room Humidity, Temperature, Average Temperature, Elapsed Time, Maturity Index, Battery Percentage \r\n");
+  } else {
+    Serial.println("File already exists");
+  }
+  file.close();
+
+  // Initialize the unsent data file
+  initializeUnsentDataFile();
+
+  getReadings();
+
+  logNonVolatileMemory();
+
+  elapsedTime += 0.5;
+
+  printUnsentReadings();
+
+  SerialMon.println("DONE! Going to sleep now.");
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+  esp_deep_sleep_start();
+}
+
+void loop() {}
+
+void initializeUnsentDataFile() {
+  File unsentDataFile = SPIFFS.open("/unsentdata.txt", "r");
+  if (!unsentDataFile) {
+    Serial.println("Unsent data file doesn't exist");
+    Serial.println("Creating unsent data file...");
+    writeFile("/unsentdata.txt", "");
+  } else {
+    Serial.println("Unsent data file already exists");
+  }
+  unsentDataFile.close();
+}
+
+void getReadings() {
+  temperature = random(200, 301) / 10.0;
+  averageTemperature = random(200, 301) / 10.0;
+  roomtemperature = random(180, 281) / 10.0;
+  roomhumidity = random(300, 601) / 10.0;
+  maturityIndex = random(0, 101) / 100.0;
+  batteryPercentage = random(900, 1001) / 10.0;
+}
+
+void logNonVolatileMemory() {
+  dataMessage = String(readingID) + "," + String(roomtemperature) + "," + String(roomhumidity) + "," + String(temperature) + "," + String(averageTemperature) + "," + String(elapsedTime) + "," + String(maturityIndex) + "," + String(batteryPercentage) + "\r\n";
+  Serial.print("Save data: ");
+  Serial.println(dataMessage);
+  appendFile("/data.txt", dataMessage.c_str());
+
+  if (modem.isGprsConnected()) {
+    if (hasInternetConnection())
+      sendUnsentData();
+    sendData(readingID, roomtemperature, roomhumidity, temperature, averageTemperature, elapsedTime, maturityIndex, batteryPercentage);
+  } else {
+    Serial.println("No internet connection.");
+    appendFile("/unsentdata.txt", dataMessage.c_str());
+  }
+}
+
+int sendData(int readingID, float roomtemperature, float roomhumidity, float temperature, float averageTemperature, float elapsedTime, float maturityIndex, float batteryPercentage) {
+  String httpRequestData = "api_key=" + apiKeyValue
+                           + "&field1=" + String(readingID)
+                           + "&field2=" + String(roomtemperature, 3)
+                           + "&field3=" + String(roomhumidity, 3)
+                           + "&field4=" + String(temperature, 3)
+                           + "&field5=" + String(averageTemperature, 3)
+                           + "&field6=" + String(elapsedTime, 3)
+                           + "&field7=" + String(maturityIndex, 3)
+                           + "&field8=" + String(batteryPercentage, 3);
+
+  if (!client.connected()) {
+    if (!client.connect(server, port)) {
+      SerialMon.println("Connection to server failed");
+      return -1;  // Return -1 to indicate connection failure
+    } else {
+      SerialMon.println("Connected to server successfully");
+    }
+  }
+
+  client.print("POST /update HTTP/1.1\n");
+  client.print("Host: " + String(server) + "\n");
+  client.print("Connection: keep-alive\n");
+  client.print("Content-Length: " + String(httpRequestData.length()) + "\n");
+  client.print("Content-Type: application/x-www-form-urlencoded\n\n");
+  client.print(httpRequestData + "\n");
+
+  uint32_t timeout = millis();
+  String response = "";
+  while (client.connected() && millis() - timeout < 30000L) {
+    while (client.available()) {
+      char c = client.read();
+      response += c;
+      timeout = millis();
+    }
+  }
+
+  SerialMon.println("HTTP Response:");
+  SerialMon.println(response);
+
+  if (response.indexOf("200 OK") != -1) {
+    SerialMon.println("Data sent successfully!");
+    return 200;  // Return 200 to indicate success
+  } else {
+    SerialMon.println("Failed to send data!");
+    appendFile("/unsentdata.txt", dataMessage.c_str());
+    return -2;  // Return -2 to indicate data sending failure
+  }
+}
+
+void sendUnsentData() {
+  File file = SPIFFS.open("/unsentdata.txt", "r");
+  if (file) {
+    String unsentData = "";
+    while (file.available()) {
+      String dataMessage = file.readStringUntil('\n');
+      int indices[8];
+      int count = 0;
+
+      for (int i = 0; i < dataMessage.length() && count < 8; i++) {
+        if (dataMessage[i] == ',') {
+          indices[count++] = i;
+        }
+      }
+
+      if (count != 7) {
+        Serial.println("Error: Incorrect data format in unsentdata.txt");
+        continue;
+      }
+
+      int readingID = dataMessage.substring(0, indices[0]).toInt();
+      float roomtemperature = dataMessage.substring(indices[0] + 1, indices[1]).toFloat();
+      float roomhumidity = dataMessage.substring(indices[1] + 1, indices[2]).toFloat();
+      float temperature = dataMessage.substring(indices[2] + 1, indices[3]).toFloat();
+      float averageTemperature = dataMessage.substring(indices[3] + 1, indices[4]).toFloat();
+      float elapsedTime = dataMessage.substring(indices[4] + 1, indices[5]).toFloat();
+      float maturityIndex = dataMessage.substring(indices[5] + 1, indices[6]).toFloat();
+      float batteryPercentage = dataMessage.substring(indices[6] + 1, indices[7]).toFloat();
+
+      int httpResponseCode = sendData(readingID, roomtemperature, roomhumidity, temperature, averageTemperature, elapsedTime, maturityIndex, batteryPercentage);
+
+      if (httpResponseCode <= 0) {
+        // If the data was not sent successfully, keep it in the unsentData string
+        unsentData += dataMessage + "\n";  // Append the unsent reading to unsentData
+        Serial.println("Failed to send data, will try again later.");
+      }
+    }
+    file.close();
+
+    // Rewrite the unsentdata.txt file with all unsent data
+    writeFile("/unsentdata.txt", unsentData.c_str());
+  }
+}
+
+
+
+void appendFile(const char* path, const char* message) {
+  File file = SPIFFS.open(path, FILE_APPEND);
+  if (!file) {
+    Serial.println("Failed to open file for appending");
+    return;
+  }
+  if (file.print(message)) {
+    Serial.println("Message appended to file");
+  } else {
+    Serial.println("Append failed");
+  }
+  file.close();
+}
+
+void writeFile(const char* path, const char* message) {
+  File file = SPIFFS.open(path, "w");
+  if (!file) {
+    Serial.println("Failed to open file for writing");
+    return;
+  }
+  if (file.print(message)) {
+    Serial.println("Message written to file");
+  } else {
+    Serial.println("Write failed");
+  }
+  file.close();
+}
+void printUnsentReadings() {
+  File file = SPIFFS.open("/unsentdata.txt", "r");
+  if (file) {
+    SerialMon.println("Unsent Readings:");
+    while (file.available()) {
+      String line = file.readStringUntil('\n');
+      SerialMon.println(line);
+    }
+    file.close();
+    SerialMon.println("End of Unsent Readings");
+  } else {
+    SerialMon.println("Failed to open unsentdata.txt");
+  }
+}
